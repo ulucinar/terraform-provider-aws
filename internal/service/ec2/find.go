@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/hashicorp/aws-sdk-go-base/v2/awsv1shim/v2/tfawserr"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+
 	"github.com/hashicorp/terraform-provider-aws/internal/tfresource"
 	"github.com/hashicorp/terraform-provider-aws/internal/verify"
 )
@@ -2294,6 +2296,17 @@ func FindVPC(conn *ec2.EC2, input *ec2.DescribeVpcsInput) (*ec2.Vpc, error) {
 
 func FindVPCs(conn *ec2.EC2, input *ec2.DescribeVpcsInput) ([]*ec2.Vpc, error) {
 	var output []*ec2.Vpc
+	var vpcIds []string
+	for _, id := range input.VpcIds {
+		if id != nil {
+			vpcIds = append(vpcIds, *id)
+		}
+	}
+	region := "<unknown>"
+	if conn.Config.Region != nil {
+		region = *conn.Config.Region
+	}
+	fmt.Printf("[diag-645, %s]: FindVPCs: Region=%q: VPC IDs=%v\n", time.Now().String(), region, vpcIds)
 
 	err := conn.DescribeVpcsPages(input, func(page *ec2.DescribeVpcsOutput, lastPage bool) bool {
 		if page == nil {
@@ -2310,6 +2323,7 @@ func FindVPCs(conn *ec2.EC2, input *ec2.DescribeVpcsInput) ([]*ec2.Vpc, error) {
 	})
 
 	if tfawserr.ErrCodeEquals(err, errCodeInvalidVPCIDNotFound) {
+		fmt.Printf("[diag-645, %s]: errCodeInvalidVPCIDNotFound: Region=%q: VPC IDs=%v: message=%s\n", time.Now().String(), region, vpcIds, err.Error())
 		return nil, &resource.NotFoundError{
 			LastError:   err,
 			LastRequest: input,
@@ -2317,9 +2331,17 @@ func FindVPCs(conn *ec2.EC2, input *ec2.DescribeVpcsInput) ([]*ec2.Vpc, error) {
 	}
 
 	if err != nil {
+		fmt.Printf("[diag-645, %s]: error: Region=%q: VPC IDs=%v: message=%s\n", time.Now().String(), region, vpcIds, err.Error())
 		return nil, err
 	}
 
+	var vpcs []ec2.Vpc
+	for _, v := range output {
+		if v != nil {
+			vpcs = append(vpcs, *v)
+		}
+	}
+	fmt.Printf("[diag-645, %s]: success: Region=%q: VPC IDs=%v: output=%v\n", time.Now().String(), region, vpcIds, vpcs)
 	return output, nil
 }
 

@@ -3,10 +3,11 @@ module github.com/terraform-providers/terraform-provider-aws/tools
 go 1.15
 
 require (
+	cloud.google.com/go/iam v0.12.0 // indirect
 	github.com/apparentlymart/go-dump v0.0.0-20190214190832-042adf3cf4a0 // indirect
 	github.com/bflad/tfproviderdocs v0.9.1
 	github.com/client9/misspell v0.3.4
-	github.com/golangci/golangci-lint v1.42.0
+	github.com/golangci/golangci-lint v1.51.2
 	github.com/hashicorp/go-changelog v0.0.0-20201005170154-56335215ce3a
 	github.com/hashicorp/terraform-exec v0.14.0 // indirect
 	github.com/katbyte/terrafmt v0.3.0

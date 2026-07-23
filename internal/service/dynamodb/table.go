@@ -26,6 +26,7 @@ import (
 	sdkid "github.com/hashicorp/terraform-plugin-sdk/v2/helper/id"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+
 	"github.com/hashicorp/terraform-provider-aws/internal/conns"
 	"github.com/hashicorp/terraform-provider-aws/internal/create"
 	tfcty "github.com/hashicorp/terraform-provider-aws/internal/cty"
@@ -936,6 +937,12 @@ func resourceTableCreate(ctx context.Context, d *schema.ResourceData, meta any) 
 		if err := updateReplicaTags(ctx, conn, aws.ToString(output.TableArn), v.List(), keyValueTags(ctx, getTagsIn(ctx))); err != nil {
 			return create.AppendDiagError(diags, names.DynamoDB, create.ErrActionCreating, resNameTable, d.Id(), fmt.Errorf("replica tags: %w", err))
 		}
+
+		if d.Get("stream_enabled").(bool) {
+			if err := updateReplicaStreams(ctx, conn, d.Id(), v.List(), true, d.Get("stream_view_type").(string), false, d.Timeout(schema.TimeoutCreate)); err != nil {
+				return create.AppendDiagError(diags, names.DynamoDB, create.ErrActionCreating, resNameTable, d.Id(), fmt.Errorf("replica streams: %w", err))
+			}
+		}
 	}
 
 	return append(diags, resourceTableRead(ctx, d, meta)...)
@@ -1433,6 +1440,18 @@ func resourceTableUpdate(ctx context.Context, d *schema.ResourceData, meta any) 
 		}
 	}
 
+	if d.HasChange("stream_enabled") || d.HasChange("stream_view_type") {
+		if replicas := d.Get("replica").(*schema.Set); replicas.Len() > 0 {
+			streamEnabled := d.Get("stream_enabled").(bool)
+			// Only stream_view_type changed while streams stay enabled: the replica
+			// stream must be cycled (disabled then re-enabled), like the primary Region.
+			cycle := streamEnabled && !d.HasChange("stream_enabled") && d.HasChange("stream_view_type")
+			if err := updateReplicaStreams(ctx, conn, d.Id(), replicas.List(), streamEnabled, d.Get("stream_view_type").(string), cycle, d.Timeout(schema.TimeoutUpdate)); err != nil {
+				return create.AppendDiagError(diags, names.DynamoDB, create.ErrActionUpdating, resNameTable, d.Id(), err)
+			}
+		}
+	}
+
 	if d.HasChange("point_in_time_recovery") {
 		if err := updatePITR(ctx, conn, d.Id(), d.Get("point_in_time_recovery.0.enabled").(bool), aws.Int32(int32(d.Get("point_in_time_recovery.0.recovery_period_in_days").(int))), meta.(*conns.AWSClient).Region(ctx), d.Timeout(schema.TimeoutUpdate)); err != nil {
 			return create.AppendDiagError(diags, names.DynamoDB, create.ErrActionUpdating, resNameTable, d.Id(), err)
@@ -1528,6 +1547,91 @@ func cycleStreamEnabled(ctx context.Context, conn *dynamodb.Client, id string, s
 
 	if _, err := waitTableActive(ctx, conn, id, timeout); err != nil {
 		return fmt.Errorf("waiting for stream cycle: %w", err)
+	}
+
+	return nil
+}
+
+func updateReplicaStreams(ctx context.Context, conn *dynamodb.Client, tableName string, replicas []any, streamEnabled bool, streamViewType string, cycle bool, timeout time.Duration) error {
+	for _, tfMapRaw := range replicas {
+		tfMap, ok := tfMapRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if v, ok := tfMap["consistency_mode"].(string); !ok || awstypes.MultiRegionConsistency(v) != awstypes.MultiRegionConsistencyStrong {
+			continue
+		}
+
+		region, ok := tfMap["region_name"].(string)
+		if !ok || region == "" {
+			continue
+		}
+
+		if cycle {
+			if err := cycleReplicaStreamEnabled(ctx, conn, tableName, region, awstypes.StreamViewType(streamViewType), timeout); err != nil {
+				return fmt.Errorf("cycling stream specification for replica (%s): %w", region, err)
+			}
+			continue
+		}
+
+		streamSpec := &awstypes.StreamSpecification{
+			StreamEnabled: aws.Bool(streamEnabled),
+		}
+		if streamEnabled {
+			streamSpec.StreamViewType = awstypes.StreamViewType(streamViewType)
+		}
+
+		if err := updateReplicaStreamSpecification(ctx, conn, tableName, region, streamSpec, timeout); err != nil {
+			return fmt.Errorf("updating stream specification for replica (%s): %w", region, err)
+		}
+	}
+
+	return nil
+}
+
+func cycleReplicaStreamEnabled(ctx context.Context, conn *dynamodb.Client, tableName, region string, streamViewType awstypes.StreamViewType, timeout time.Duration) error {
+	if err := updateReplicaStreamSpecification(ctx, conn, tableName, region, &awstypes.StreamSpecification{
+		StreamEnabled: aws.Bool(false),
+	}, timeout); err != nil {
+		return fmt.Errorf("disabling stream: %w", err)
+	}
+
+	if err := updateReplicaStreamSpecification(ctx, conn, tableName, region, &awstypes.StreamSpecification{
+		StreamEnabled:  aws.Bool(true),
+		StreamViewType: streamViewType,
+	}, timeout); err != nil {
+		return fmt.Errorf("re-enabling stream: %w", err)
+	}
+
+	return nil
+}
+
+func updateReplicaStreamSpecification(ctx context.Context, conn *dynamodb.Client, tableName, region string, streamSpec *awstypes.StreamSpecification, timeout time.Duration) error {
+	input := &dynamodb.UpdateTableInput{
+		TableName:           aws.String(tableName),
+		StreamSpecification: streamSpec,
+	}
+	optFn := func(o *dynamodb.Options) { o.Region = region }
+
+	err := tfresource.Retry(ctx, max(replicaUpdateTimeout, timeout), func(ctx context.Context) *tfresource.RetryError {
+		if _, err := conn.UpdateTable(ctx, input, optFn); err != nil {
+			if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
+				return tfresource.RetryableError(err)
+			}
+			if errs.IsA[*awstypes.ResourceInUseException](err) {
+				return tfresource.RetryableError(err)
+			}
+			return tfresource.NonRetryableError(err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if _, err := waitReplicaActive(ctx, conn, tableName, region, timeout, replicaPropagationDelay); err != nil {
+		return err
 	}
 
 	return nil
